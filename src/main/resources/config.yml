@@ -4,3 +4,14 @@
 # RESTART: Uses Bukkit's built-in restart command (Requires a start script).
 # STOP: Simply shuts down the server. Recommended for clean updates with external scripts.
 update-action: STOP
+
+# Custom User-Agent for API requests (PaperMC)
+# The plugin will automatically use its current version if not specified.
+user-agent: "AutoServerUpdater/2.3 (contact@tamion.de)"
+
+# Daily Restart Configuration
+daily-restart:
+  # If enabled, the server will perform the update-action even if no update was found.
+  enabled: false
+  # Time in 24h format (HH:mm)
+  time: "04:00"

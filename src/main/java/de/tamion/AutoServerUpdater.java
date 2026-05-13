@@ -12,105 +12,134 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.time.Duration;
+import java.time.LocalTime;
 import java.util.logging.Level;
 
 public final class AutoServerUpdater extends JavaPlugin {
 
-    private final String USER_AGENT = "AutoServerUpdater/1.0 (contact@tamion.de)";
-
     @Override
     public void onEnable() {
         saveDefaultConfig();
+        updateConfig();
+        startDailyRestartTask();
 
         File serverJar = new File(System.getProperty("java.class.path"));
         ServerBuildInfo buildInfo = ServerBuildInfo.buildInfo();
 
-        int currentBuildInt = buildInfo.buildNumber().isPresent() ? buildInfo.buildNumber().getAsInt() : -1;
+        int currentBuild = buildInfo.buildNumber().isPresent() ? buildInfo.buildNumber().getAsInt() : -1;
         String mcVersion = buildInfo.minecraftVersionId();
+        String brand = buildInfo.brandName().toLowerCase();
+        String pluginVersion = getDescription().getVersion();
+        String userAgent = getConfig().getString("user-agent", "AutoServerUpdater/" + pluginVersion + " (contact@tamion.de)");
 
         try {
             String downloadUrl = null;
-            String latestBuildStr = null;
+            int highestBuild = -1;
 
-            if (buildInfo.brandName().contains("Paper")) {
-                JsonNode root = fetchJson("https://fill.papermc.io/v3/projects/paper/versions/" + mcVersion + "/builds");
-
+            if (brand.contains("paper")) {
+                JsonNode root = fetchJson("https://fill.papermc.io/v3/projects/paper/versions/" + mcVersion + "/builds", userAgent);
                 if (root != null && root.isArray() && root.size() > 0) {
-                    int highestBuildFound = -1;
-                    JsonNode bestBuildObj = null;
-
-                    for (JsonNode buildNode : root) {
-                        if (buildNode.has("id")) {
-                            int buildId = buildNode.get("id").asInt();
-                            if (buildId > highestBuildFound) {
-                                highestBuildFound = buildId;
-                                bestBuildObj = buildNode;
-                            }
-                        }
+                    JsonNode best = null;
+                    for (JsonNode node : root) {
+                        int id = node.get("id").asInt();
+                        if (id > highestBuild) { highestBuild = id; best = node; }
                     }
-
-                    if (bestBuildObj != null) {
-                        latestBuildStr = String.valueOf(highestBuildFound);
-                        if (highestBuildFound > currentBuildInt) {
-                            JsonNode downloads = bestBuildObj.get("downloads");
-                            if (downloads != null && downloads.has("server:default")) {
-                                downloadUrl = downloads.get("server:default").get("url").asText();
-                            }
-                        }
+                    if (highestBuild > currentBuild && best != null) {
+                        downloadUrl = best.get("downloads").get("server:default").get("url").asText();
                     }
                 }
-
-            } else if (buildInfo.brandName().contains("Purpur")) {
-                JsonNode root = fetchJson("https://api.purpurmc.org/v2/purpur/" + mcVersion + "/latest");
+            } else if (brand.contains("purpur")) {
+                JsonNode root = fetchJson("https://api.purpurmc.org/v2/purpur/" + mcVersion + "/latest", userAgent);
                 if (root != null && root.has("build")) {
-                    latestBuildStr = root.get("build").asText();
-                    int latestPurpurBuild = Integer.parseInt(latestBuildStr);
-                    if (latestPurpurBuild > currentBuildInt) {
-                        downloadUrl = "https://api.purpurmc.org/v2/purpur/" + mcVersion + "/" + latestBuildStr + "/download";
+                    highestBuild = root.get("build").asInt();
+                    if (highestBuild > currentBuild) {
+                        downloadUrl = "https://api.purpurmc.org/v2/purpur/" + mcVersion + "/" + highestBuild + "/download";
+                    }
+                }
+            } else if (brand.contains("leaf")) {
+                JsonNode root = fetchJson("https://api.leafmc.one/v2/projects/leaf/versions/" + mcVersion + "/builds", userAgent);
+                if (root != null && root.has("builds")) {
+                    for (JsonNode b : root.get("builds")) {
+                        int bNum = b.get("build").asInt();
+                        if (bNum > highestBuild) highestBuild = bNum;
+                    }
+                    if (highestBuild > currentBuild) {
+                        downloadUrl = String.format("https://api.leafmc.one/v2/projects/leaf/versions/%s/builds/%d/downloads/leaf-%s-%d.jar",
+                                mcVersion, highestBuild, mcVersion, highestBuild);
                     }
                 }
             }
 
             if (downloadUrl != null) {
-                getLogger().warning("Update found! Current build: " + currentBuildInt + " -> New build: " + latestBuildStr);
-                downloadFile(downloadUrl, serverJar);
-
-                String action = getConfig().getString("update-action", "RESTART").toUpperCase();
-                if (action.equals("STOP")) {
-                    getLogger().warning("Download complete. Shutting down server as requested...");
-                    Bukkit.shutdown();
-                } else {
-                    getLogger().warning("Download complete. Triggering Spigot restart...");
-                    Bukkit.getServer().spigot().restart();
-                }
+                getLogger().info("New build detected: " + highestBuild + " (Current: " + currentBuild + ")");
+                getLogger().info("Downloading update...");
+                downloadFile(downloadUrl, serverJar, userAgent);
+                executeAction();
             } else {
-                getLogger().info("Server is up to date (Build " + currentBuildInt + ").");
-                Bukkit.getPluginManager().disablePlugin(this);
+                if (!getConfig().getBoolean("daily-restart.enabled", false)) {
+                    getLogger().info("No update found and daily restart is disabled. Disabling plugin.");
+                    Bukkit.getPluginManager().disablePlugin(this);
+                }
             }
 
         } catch (Exception e) {
-            getLogger().log(Level.SEVERE, "Error during update process: " + e.getMessage());
-            e.printStackTrace();
+            getLogger().log(Level.SEVERE, "Update check failed: " + e.getMessage());
         }
     }
 
-    private JsonNode fetchJson(String urlString) throws IOException {
-        HttpURLConnection conn = (HttpURLConnection) new URL(urlString).openConnection();
-        conn.setRequestProperty("User-Agent", USER_AGENT);
-        conn.setRequestProperty("Accept", "application/json");
-        conn.setConnectTimeout(5000);
-        if (conn.getResponseCode() != 200) return null;
-        try (InputStream in = conn.getInputStream()) {
-            return new ObjectMapper().readTree(in);
+    private void updateConfig() {
+        boolean changed = false;
+        String currentVersion = getDescription().getVersion();
+
+        if (!getConfig().contains("update-action")) {
+            getConfig().set("update-action", "STOP");
+            changed = true;
         }
+        if (!getConfig().contains("user-agent")) {
+            getConfig().set("user-agent", "AutoServerUpdater/" + currentVersion + " (contact@tamion.de)");
+            changed = true;
+        }
+        if (!getConfig().contains("daily-restart.enabled")) {
+            getConfig().set("daily-restart.enabled", false);
+            changed = true;
+        }
+        if (!getConfig().contains("daily-restart.time")) {
+            getConfig().set("daily-restart.time", "04:00");
+            changed = true;
+        }
+
+        if (changed) saveConfig();
     }
 
-    private void downloadFile(String urlString, File target) throws IOException {
-        HttpURLConnection conn = (HttpURLConnection) new URL(urlString).openConnection();
-        conn.setRequestProperty("User-Agent", USER_AGENT);
-        conn.setInstanceFollowRedirects(true);
-        try (InputStream in = conn.getInputStream()) {
-            FileUtils.copyInputStreamToFile(in, target);
-        }
+    private void startDailyRestartTask() {
+        if (!getConfig().getBoolean("daily-restart.enabled", false)) return;
+        try {
+            LocalTime target = LocalTime.parse(getConfig().getString("daily-restart.time", "04:00"));
+            long delay = Duration.between(LocalTime.now(), target).toSeconds();
+            if (delay < 0) delay += 86400;
+            Bukkit.getScheduler().runTaskTimer(this, this::executeAction, delay * 20L, 1728000L);
+        } catch (Exception ignored) {}
+    }
+
+    private void executeAction() {
+        String action = getConfig().getString("update-action", "RESTART").toUpperCase();
+        if (action.equals("STOP")) Bukkit.shutdown();
+        else Bukkit.getServer().spigot().restart();
+    }
+
+    private JsonNode fetchJson(String url, String ua) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestProperty("User-Agent", ua);
+        c.setRequestProperty("Accept", "application/json");
+        if (c.getResponseCode() != 200) return null;
+        try (InputStream in = c.getInputStream()) { return new ObjectMapper().readTree(in); }
+    }
+
+    private void downloadFile(String url, File target, String ua) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestProperty("User-Agent", ua);
+        c.setInstanceFollowRedirects(true);
+        try (InputStream in = c.getInputStream()) { FileUtils.copyInputStreamToFile(in, target); }
     }
 }
